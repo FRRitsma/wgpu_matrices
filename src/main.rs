@@ -39,7 +39,7 @@ async fn main() {
     // let cpu_buffer_a: &[u8] = bytemuck::cast_slice(&MATRIX_A);
     // let cpu_buffer_b: &[u8] = bytemuck::cast_slice(&MATRIX_B);
 
-    let (device, _queue) = initialize_components().await;
+    let (device, queue) = initialize_components().await;
 
     let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
@@ -62,7 +62,7 @@ async fn main() {
     let buffer_c = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Matrix C Buffer"),
         size: std::mem::size_of_val(&MATRIX_A) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
@@ -121,5 +121,34 @@ async fn main() {
         compute_pass.set_pipeline(&compute_pipeline);
         compute_pass.set_bind_group(0, &bind_group, &[]);
         compute_pass.dispatch_workgroups(n, 1, 1); // Adjust N according to your workgroup size and number of elements
+    }
+
+    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Matrix C CPU Buffer"),
+        size: std::mem::size_of_val(&MATRIX_A) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    encoder.copy_buffer_to_buffer(
+        &buffer_c,
+        0,
+        &staging_buffer,
+        0,
+        std::mem::size_of_val(&MATRIX_A) as u64,
+    );
+    queue.submit(Some(encoder.finish()));
+
+    // Step 4: Map the staging buffer and read data
+    let output_slice = staging_buffer.slice(..);
+    let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+    output_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+    println!("pre-poll {:?}", std::time::Instant::now());
+    device.poll(wgpu::Maintain::Wait);
+    println!("post-poll {:?}", std::time::Instant::now());
+    if let Some(Ok(())) = receiver.receive().await {
+        let data_raw = &*output_slice.get_mapped_range();
+        let data: &[f32] = bytemuck::cast_slice(data_raw);
+        println!("data: {:?}", data);
     }
 }
