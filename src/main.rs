@@ -1,7 +1,13 @@
-use wgpu::util::DeviceExt;
-use wgpu::{BindGroupLayoutEntry, Device, Queue};
-const MATRIX_A: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
-const MATRIX_B: [f32; 4] = [7.0, 8.0, 9.0, 10.0];
+use matrix::Matrix;
+use wgpu::{BindGroupLayoutEntry, Buffer, Device, Queue};
+
+mod matrix;
+
+const K: usize = 100;
+const M: usize = 1000;
+const N: usize = 10000;
+const MATRIX_A: [f32; K * M] = [1.0; K * M];
+const MATRIX_B: [f32; K * N] = [1.0; K * N];
 
 async fn initialize_components() -> (Device, Queue) {
     let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
@@ -34,37 +40,30 @@ fn bind_group_layout_entry(binding: u32, read_only: bool) -> BindGroupLayoutEntr
     }
 }
 
-#[tokio::main]
-async fn main() {
-    // let cpu_buffer_a: &[u8] = bytemuck::cast_slice(&MATRIX_A);
-    // let cpu_buffer_b: &[u8] = bytemuck::cast_slice(&MATRIX_B);
-
-    let (device, queue) = initialize_components().await;
-
-    let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+fn result_buffer(device: &Device, buffer_length: u64) -> Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        source: wgpu::ShaderSource::Wgsl(include_str!("matrix.wgsl").into()),
-    });
-
-    // 1. Create Buffer Objects
-    let buffer_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Matrix A Buffer"),
-        contents: bytemuck::cast_slice(&MATRIX_A),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-
-    let buffer_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Matrix B Buffer"),
-        contents: bytemuck::cast_slice(&MATRIX_B),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-
-    let buffer_c = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Matrix C Buffer"),
-        size: std::mem::size_of_val(&MATRIX_A) as u64,
+        size: buffer_length,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
+    })
+}
+
+#[tokio::main]
+async fn main() {
+    let (device, queue) = initialize_components().await;
+    let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(include_str!("matrix_backup.wgsl").into()),
     });
+
+    let matrix_a = Matrix::new(M, K, &MATRIX_A);
+    let matrix_b = Matrix::new(K, N, &MATRIX_B);
+
+    // 1. Create Buffer Objects
+    let buffer_a = matrix_a.as_buffer(&device);
+    let buffer_b = matrix_b.as_buffer(&device);
+    let buffer_c = matrix_a.result_buffer_multiplication(&device, matrix_b);
 
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("Compute Bind Group Layout"),
@@ -114,41 +113,35 @@ async fn main() {
     });
 
     {
-        let n = 4;
+        let n = 16;
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Compute Pass"),
         });
         compute_pass.set_pipeline(&compute_pipeline);
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(n, 1, 1); // Adjust N according to your workgroup size and number of elements
+        compute_pass.dispatch_workgroups(n, n, 1); // Adjust N according to your workgroup size and number of elements
     }
 
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Matrix C CPU Buffer"),
-        size: std::mem::size_of_val(&MATRIX_A) as u64,
+        size: buffer_c.size(),
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
 
-    encoder.copy_buffer_to_buffer(
-        &buffer_c,
-        0,
-        &staging_buffer,
-        0,
-        std::mem::size_of_val(&MATRIX_A) as u64,
-    );
+    encoder.copy_buffer_to_buffer(&buffer_c, 0, &staging_buffer, 0, buffer_c.size());
     queue.submit(Some(encoder.finish()));
 
     // Step 4: Map the staging buffer and read data
     let output_slice = staging_buffer.slice(..);
     let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
     output_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
-    println!("pre-poll {:?}", std::time::Instant::now());
+    let pre_poll = std::time::Instant::now();
     device.poll(wgpu::Maintain::Wait);
-    println!("post-poll {:?}", std::time::Instant::now());
+    let post_poll = std::time::Instant::now();
+    println!("poll time: {:?}", post_poll - pre_poll);
     if let Some(Ok(())) = receiver.receive().await {
         let data_raw = &*output_slice.get_mapped_range();
-        let data: &[f32] = bytemuck::cast_slice(data_raw);
-        println!("data: {:?}", data);
+        let _data: &[f32] = bytemuck::cast_slice(data_raw);
     }
 }
